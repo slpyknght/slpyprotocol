@@ -6,11 +6,11 @@ import (
 )
 
 const(
+	// length in byte
 	VERSION_LEN int = 1
-	DATETIME_LEN int = 4
-	ID_LEN int = 1
 	TYPE_LEN int = 1
-	CONTENT_LEN int = 1
+	DATETIME_LEN int = 4
+	SENDER int = 4
 )
 
 type MessageType int
