@@ -14,11 +14,12 @@ const(
 	TYPE int = 1
 	ORIGIN int = 4
 	DESTINATION int = 4
+	SEQ_ID int = 1
 	SEQ_LENGTH int = 1
 	SEQ_INDEX int = 1
-	CONTENT_LENGTH int = 4
+	CONTENT_LENGTH int = 2
 	
-	HEADER_SIZE int = 16
+	HEADER_SIZE int = 15
 	BUFFER_SIZE int = 128
 )
 
@@ -76,81 +77,107 @@ func (msg Message)ToPackage()[]MessageRaw{
 	// }
 	// contentIdx := 0
 	seqId := make([]byte,4)
-	binary.LittleEndian.PutUint32(seqId, rand.Uint32())
-	var maxLen uint16 = uint16(BUFFER_SIZE - HEADER_SIZE) + 1
-	remainingContent := msg.ContentLength
-	var cidx uint16 = 0
-	var seqLen = 1 + byte(msg.ContentLength / maxLen)
+	binary.BigEndian.PutUint32(seqId, rand.Uint32())
+	var maxLen uint16 = uint16(BUFFER_SIZE - HEADER_SIZE)
+	var seqLen = byte(msg.ContentLength / maxLen)
+	if msg.ContentLength % maxLen != 0{
+		seqLen += 1
+	}
+	seqLen = max(seqLen, 1)
+	fmt.Printf("content: %v, maxLen: %v = %v segments.\n", msg.ContentLength, maxLen, seqLen)
+	msg.SequenceId = seqId[0]
 	for i := byte(0); i < seqLen; i++{
-		var clen uint16
-		clen = min(maxLen, remainingContent)
-		a := []byte{msg.Version, byte(msg.Type)	}
-		a = binary.LittleEndian.AppendUint32(a, msg.Origin)
-		a = binary.LittleEndian.AppendUint32(a, msg.Destination)
-		// a = binary.LittleEndian.AppendUint32(a, 1) // time or packacke number
-		a = append(a, seqId[0], seqLen, (i+1))
-		// fmt.Printf("content len %v / %v",clen, binary.LittleEndian.(clen))
-		a = binary.LittleEndian.AppendUint16(a, clen)
-		a = append(a, msg.Content[cidx:cidx+clen]...)
-		r = append(r, a)
-		cidx += clen
-		remainingContent -= clen
-		fmt.Printf("created package[%v/%v]: %v\n", i+1, seqLen, len(a))
-		fmt.Printf("package header: %v\n", a[:HEADER_SIZE])
+		r = append(r, createSegment(msg, i, maxLen, seqLen))
 	}
 	return r
 }
 
+func createSegment(msg Message, idx byte, maxLen uint16, seqLen byte)MessageRaw{
+	contentStart := uint16(idx) * maxLen
+	clen := min(msg.ContentLength - contentStart, maxLen)
+	log.Printf("create seg: %v from %v to %v", idx, contentStart, contentStart + clen  )
+	segment := []byte{msg.Version, byte(msg.Type)	}
+	segment = binary.BigEndian.AppendUint32(segment, msg.Origin)
+	segment = binary.BigEndian.AppendUint32(segment, msg.Destination)
+	segment = append(segment, msg.SequenceId, seqLen, idx + 1)
+	segment = binary.BigEndian.AppendUint16(segment, clen)
+	log.Println(segment)
+	log.Println(len(segment))
+	if clen == 0{
+		return segment
+	}
+	segment = append(segment, msg.Content[contentStart:contentStart+clen]...)
+	log.Printf("segment len with content: %d", len(segment))
+	return segment
+}
+
 func (data MessageRaw)ToMessage()(Message,error){
 	if data[0] != 0x01{
-		return Message{}, fmt.Errorf("invalid message version: %v", data[0])
+		return Message{}, fmt.Errorf("invalid message version: %v", data[0:HEADER_SIZE+1])
 	}
 	msg := Message{Version: data[0]}
 	msg.Type = MessageType(data[1])
-	msg.Origin = binary.LittleEndian.Uint32(data[2:6])
-	msg.Destination = binary.LittleEndian.Uint32(data[6:10])
-	// msg.Datetime = binary.LittleEndian.Uint32(data[10:14])
+	msg.Origin = binary.BigEndian.Uint32(data[2:6])
+	msg.Destination = binary.BigEndian.Uint32(data[6:10])
+	// msg.Datetime = binary.BigEndian.Uint32(data[10:14])
 	msg.SequenceId = data[10]
 	msg.SequenceLength = data[11]
 	msg.SequenceIndex = data[12]
-	// fmt.Printf("bytes:%v, uint16: %v\n", data[13:15], binary.LittleEndian.Uint16(data[13:15]))
-	msg.ContentLength = binary.LittleEndian.Uint16(data[13:15])
+	// fmt.Printf("bytes:%v, uint16: %v\n", data[13:15], binary.BigEndian.Uint16(data[13:15]))
+	msg.ContentLength = binary.BigEndian.Uint16(data[13:15])
 	if msg.ContentLength > 0{
 		msg.Content = data[15:15+msg.ContentLength]
 	}
 	return msg, nil
 }
 
-func (buf MessageBuffer)Combine()(Message, error){
-	if len(buf) != int(buf[0].SequenceLength){
-		return Message{}, fmt.Errorf("invalid MessageBuffer length. expected:%d, got:%d", buf[0].SequenceLength, len(buf))
+func (buffer *MessageBuffer)Add(message Message)(Message, bool, error){
+	if message.SequenceLength <= 1{
+		return message, true, nil
 	}
-	m := Message{
-		Version: buf[0].Version,
-		Type: buf[0].Type,
-		Origin: buf[0].Origin,
-		Destination: buf[0].Destination,
-		SequenceId: buf[0].SequenceId,
-		SequenceLength: buf[0].SequenceLength,
-		ContentLength: 0,
-		Content: make([]byte, 0),
+	var msg Message = message
+	*buffer = append(*buffer, msg)
+	// log.Printf("recived partial message: %v of %v", msg.SequenceIndex, msg.SequenceLength)
+	// log.Printf("got %v of %v", len(buffer), msg.SequenceLength)
+	if len(*buffer) == int(msg.SequenceLength){
+		for _, x := range *buffer{
+			fmt.Println(x)
+		}
+		m, err := buffer.Combine()
+		if err != nil{
+			log.Println(err)
+			return Message{}, false, err
+		}
+		msg = m
+		return msg, true, nil
+	}else{
+		return msg, false, nil
 	}
+}
+
+func (buf *MessageBuffer)Combine()(Message, error){
+	if len(*buf) != int((*buf)[0].SequenceLength){
+		return Message{}, fmt.Errorf("invalid MessageBuffer length. expected:%d, got:%d", (*buf)[0].SequenceLength, len(*buf))
+	}
+	m := (*buf)[0]
+	m.ContentLength = 0
+	m.Content = make([]byte, 0)
 	i := byte(0)
 	next := byte(1)
 	missingIndex := false
 	for{
-		if buf[i].SequenceIndex == next{
+		if (*buf)[i].SequenceIndex == next{
 			log.Printf("appending %v of %v", next, m.SequenceLength)
-			m.Content = append(m.Content, buf[i].Content...)
-			m.ContentLength += buf[i].ContentLength
+			m.Content = append(m.Content, (*buf)[i].Content...)
+			m.ContentLength += (*buf)[i].ContentLength
 			missingIndex = false
 			next++
-			if next >= m.SequenceLength{
+			if next > m.SequenceLength{
 				break
 			}
 		}
 		i++
-		if i == byte(len(buf)){
+		if i == byte(len(*buf)){
 			if missingIndex{
 				break
 			}
@@ -159,8 +186,17 @@ func (buf MessageBuffer)Combine()(Message, error){
 		}
 	}
 	if missingIndex{
-		return Message{}, fmt.Errorf("sequence is missing an index: %v", next)
+		return Message{}, fmt.Errorf("sequence %v is missing index: %v", m.SequenceId, next)
 	}
 	return m,nil
 }
 
+func (m Message)Log(){
+	log.Printf("\t\t=== %v ===", m.SequenceId)
+	log.Printf("\tversion:\t%v", m.Version)
+	log.Printf("\ttype:\t\t%v", m.Type)
+	log.Printf("\torigin:\t\t%v", m.Origin)
+	log.Printf("\tdest:\t\t%v", m.Destination)
+	log.Printf("\tseq:\t\t%v: (%v/%v)", m.SequenceId, m.SequenceIndex, m.SequenceLength)
+	log.Printf("\tcontent len:\t%v", m.ContentLength)
+}
